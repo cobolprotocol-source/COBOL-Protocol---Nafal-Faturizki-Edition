@@ -29,6 +29,8 @@ COPY requirements.txt .
 COPY config.py .
 COPY engine.py .
 COPY __init__.py .
+COPY validator.py .
+COPY verify.sh .
 
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt

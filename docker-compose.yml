@@ -92,6 +92,26 @@ services:
       timeout: 10s
       retries: 3
 
+  # Validator Node (integrity monitoring)
+  validator:
+    build: .
+    container_name: cobol-validator
+    environment:
+      - COBOL_NODE_ID=validator
+      - COBOL_MODE=validation
+    volumes:
+      - ./data:/app/data
+      - ./verify.sh:/app/verify.sh
+    networks:
+      - cobol-network
+    restart: unless-stopped
+    depends_on:
+      - edge_node_l1
+      - edge_node_l3
+      - highspec_node_l5
+      - highspec_node_l8
+    command: ["bash", "-c", "while true; do python validator.py; sleep 60; done"]
+
 networks:
   cobol-network:
     driver: bridge

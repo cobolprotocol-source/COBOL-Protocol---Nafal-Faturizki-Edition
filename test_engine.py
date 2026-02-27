@@ -364,6 +364,50 @@ class TestCobolEngine:
         expected_ratio = len(data) / len(compressed)
         assert abs(metadata.compression_ratio - expected_ratio) < 0.01
 
+    def test_entropy_cache(self):
+        """Entropy calculations should be cached when enabled."""
+        config = EntropyConfig(cache_results=True)
+        detector = AdaptiveEntropyDetector(config)
+        data = b"0123456789" * 10
+        ent1 = detector.calculate_entropy(data)
+        ent2 = detector.calculate_entropy(data)
+        # second call should use cache (same value and stored under key 0 then 1)
+        assert ent1 == ent2
+        assert 0 in detector._entropy_cache
+        assert 1 in detector._entropy_cache
+
+
+# ============================================================================
+# EXTREME ENGINE & LAYER 8 TESTS
+# ============================================================================
+
+class TestLayer8RegistryAndEngine:
+    def test_registry_and_layer8_roundtrip(self):
+        from extreme_engine import GlobalPatternRegistry, Layer8UltraExtremeMapper
+
+        registry = GlobalPatternRegistry()
+        pid = registry.register(b"SUPERLONGPATTERN")
+        assert pid == 0
+        assert registry.lookup(pid) == b"SUPERLONGPATTERN"
+
+        mapper = Layer8UltraExtremeMapper(registry)
+        data = b"AAA" + b"SUPERLONGPATTERN" + b"BBB"
+        compressed, meta = mapper.compress(data)
+        assert len(compressed) < len(data)
+        decompressed = mapper.decompress(compressed, meta)
+        assert decompressed == data
+
+    def test_extreme_engine_pipeline(self):
+        from extreme_engine import ExtremeCobolEngine
+
+        engine = ExtremeCobolEngine()
+        # register a simple pattern for the engine to exploit
+        engine.register_pattern(b"hello")
+        raw = b"hello world hello"
+        comp, meta = engine.compress_block(raw)
+        dec = engine.decompress_block(comp, meta)
+        assert dec == raw
+
 
 # ============================================================================
 # INTEGRATION TESTS

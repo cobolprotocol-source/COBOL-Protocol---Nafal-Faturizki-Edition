@@ -379,9 +379,10 @@ class DictionaryManager:
         """
         if layer.startswith("L1"):
             # Semantic tokenization: split by whitespace and common delimiters
+            # Preserve whitespace tokens so reconstruction can be lossless
             text = data.decode('utf-8', errors='ignore')
             import re
-            tokens = re.findall(r'\b\w+\b|[^\w\s]', text)
+            tokens = re.findall(r'\s+|\b\w+\b|[^\w\s]', text)
             return tokens
 
         elif layer.startswith("L2"):
@@ -503,7 +504,7 @@ class AdaptiveEntropyDetector:
 
         return entropy
 
-    def should_skip_compression(self, data: bytes, block_id: int = 0) -> bool:
+    def should_skip_compression(self, data: bytes, block_id: Optional[int] = None) -> bool:
         """
         Determine if compression should be skipped based on entropy.
         
@@ -511,12 +512,12 @@ class AdaptiveEntropyDetector:
         maximum entropy** (8 bits).  For example a threshold of `0.95` means
         skip when entropy > 7.6 bits.
         """
-        # Obtain entropy (cached or new)
-        if block_id in self._entropy_cache:
+        # Obtain entropy (cached only when a block_id is explicitly provided)
+        if block_id is not None and block_id in self._entropy_cache:
             entropy = self._entropy_cache[block_id]
         else:
             entropy = self.calculate_entropy(data)
-            if self.config.cache_results:
+            if block_id is not None and self.config.cache_results:
                 self._entropy_cache[block_id] = entropy
 
         # Normalize to [0,1] fraction of max entropy
@@ -715,12 +716,6 @@ class Layer1SemanticMapper:
 
             decompressed_data = output.getvalue().encode('utf-8')
 
-            # Verify integrity
-            if metadata.integrity_hash:
-                computed_hash = hashlib.sha256(decompressed_data).digest()
-                if computed_hash != metadata.integrity_hash:
-                    raise IntegrityError("L1 decompression integrity check failed")
-
             return decompressed_data
 
         except (DecompressionError, IntegrityError):
@@ -890,42 +885,68 @@ class Layer3DeltaEncoder:
             output = bytearray()
             idx = 0
 
-            # Read first byte
+            # Read first byte (reference) and advance
             first_byte = data[idx]
             output.append(first_byte)
             idx += 1
 
-            if len(data) == 1:
-                return bytes(output)
+            # If only a single byte was stored, return it
+            if idx >= len(data):
+                decompressed_data = bytes(output)
+                if metadata.integrity_hash:
+                    computed_hash = hashlib.sha256(decompressed_data).digest()
+                    if computed_hash != metadata.integrity_hash:
+                        raise IntegrityError("L3 decompression integrity check failed")
+                return decompressed_data
 
-            # Read first delta
+            # Read first delta (stored as single unsigned byte)
             first_delta = data[idx]
             idx += 1
 
-            # Variable-length decode deltas
-            deltas2_signed = self._varint_decode_array(data[idx:])
+            # Decode the remaining varint stream into signed delta-of-delta values
+            varint_stream = data[idx:]
+            compressed_d2 = self._varint_decode_array(varint_stream)
 
-            # Reconstruct deltas1 from deltas2
+            # Expand zero-run encoding used during compression. The encoder
+            # emits [0, -N] to mean a run of N zeros, and a lone 0 for a
+            # single zero. Here we convert the compressed form back into
+            # the full delta-of-delta sequence.
+            deltas2_expanded: List[int] = []
+            j = 0
+            while j < len(compressed_d2):
+                v = compressed_d2[j]
+                if v == 0:
+                    # Run marker: next value may be negative run-length
+                    if j + 1 < len(compressed_d2) and compressed_d2[j + 1] < 0:
+                        run_len = -compressed_d2[j + 1]
+                        deltas2_expanded.extend([0] * run_len)
+                        j += 2
+                    else:
+                        deltas2_expanded.append(0)
+                        j += 1
+                else:
+                    deltas2_expanded.append(v)
+                    j += 1
+
+            # Reconstruct first-order deltas from delta-of-delta
             deltas1 = [int(first_delta)]
-            for d2 in deltas2_signed:
+            for d2 in deltas2_expanded:
                 new_delta = (deltas1[-1] + d2) & 0xFF
                 deltas1.append(new_delta)
 
-            # Reconstruct original values
+            # Reconstruct original byte sequence
             current_value = first_byte
-            output.append((current_value + deltas1[0]) & 0xFF)
+            if deltas1:
+                # Apply first delta to get second byte
+                next_value = (current_value + deltas1[0]) & 0xFF
+                output.append(next_value)
+                current_value = next_value
 
-            for delta in deltas1[1:]:
-                current_value = (current_value + delta) & 0xFF
-                output.append(current_value)
+                for delta in deltas1[1:]:
+                    current_value = (current_value + delta) & 0xFF
+                    output.append(current_value)
 
             decompressed_data = bytes(output)
-
-            # Verify integrity
-            if metadata.integrity_hash:
-                computed_hash = hashlib.sha256(decompressed_data).digest()
-                if computed_hash != metadata.integrity_hash:
-                    raise IntegrityError("L3 decompression integrity check failed")
 
             return decompressed_data
 
@@ -1134,12 +1155,30 @@ class CobolEngine:
             self.stats["total_compressed_size"] += len(data)
             return data, metadata
 
+        # Track applied layers across the pipeline so metadata reflects
+        # the full set of layers used (not just the last one).
+        applied_layers: List[CompressionLayer] = []
+
         # Apply Layer 1: Semantic Mapping (for text)
         try:
             layer1_output, layer1_metadata = self.layer1_semantic.compress(data)
-            current_data = layer1_output
-            metadata = layer1_metadata
-            metadata.entropy_score = entropy_profile['entropy']
+            # Always record that L1 was attempted
+            applied_layers.extend(layer1_metadata.layers_applied)
+            # Only swap data/metadata if we actually see a size improvement
+            if layer1_metadata.compressed_size < len(data):
+                current_data = layer1_output
+                metadata = layer1_metadata
+                metadata.entropy_score = entropy_profile['entropy']
+            else:
+                logger.debug("Layer 1 did not improve size; keeping original data")
+                current_data = data
+                metadata = CompressionMetadata(
+                    block_id=self.stats["blocks_processed"],
+                    original_size=len(data),
+                    compressed_size=len(data),
+                    compression_ratio=1.0,
+                    entropy_score=entropy_profile['entropy'],
+                )
         except CompressionError as e:
             logger.warning(f"Layer 1 failed: {e}, continuing with data")
             current_data = data
@@ -1154,16 +1193,38 @@ class CobolEngine:
         # Apply Layer 3: Delta Encoding (for numeric patterns)
         try:
             layer3_output, layer3_metadata = self.layer3_delta.compress(current_data)
+            # record that L3 was attempted regardless of gain
+            applied_layers.extend(layer3_metadata.layers_applied)
             if layer3_metadata.compression_ratio > metadata.compression_ratio:
                 current_data = layer3_output
+                # Merge layer metadata while retaining original layer info
                 metadata = layer3_metadata
                 metadata.entropy_score = entropy_profile['entropy']
         except CompressionError as e:
             logger.warning(f"Layer 3 failed: {e}, using previous output")
 
+        # Attach the complete list of applied layers and finalize metadata
+        # to reflect the original block sizes and final compressed size so
+        # callers always see original_size==len(data).
+        # Deduplicate while preserving order
+        if applied_layers:
+            seen = set()
+            merged = []
+            for l in applied_layers:
+                if l not in seen:
+                    merged.append(l)
+                    seen.add(l)
+            metadata.layers_applied = merged
+        original_len = len(data)
+        metadata.original_size = original_len
+        metadata.compressed_size = len(current_data)
+        metadata.compression_ratio = (original_len / metadata.compressed_size) if metadata.compressed_size > 0 else 0
+        # Ensure integrity hash refers to the original input
+        metadata.integrity_hash = hashlib.sha256(data).digest()
+
         # Update statistics
         self.stats["blocks_processed"] += 1
-        self.stats["total_original_size"] += len(data)
+        self.stats["total_original_size"] += original_len
         self.stats["total_compressed_size"] += len(current_data)
 
         for layer in metadata.layers_applied:
@@ -1193,6 +1254,15 @@ class CobolEngine:
         current_data = data
         layers_applied = metadata.layers_applied
 
+        # If compression produced no size change, assume no layers actually
+        # transformed the data and simply verify integrity.
+        if metadata.compressed_size == metadata.original_size:
+            if metadata.integrity_hash:
+                computed = hashlib.sha256(current_data).digest()
+                if computed != metadata.integrity_hash:
+                    raise IntegrityError("Final decompression integrity check failed")
+            return current_data
+
         # Decompress in reverse order
         if CompressionLayer.L3_DELTA_ENCODING in layers_applied:
             try:
@@ -1207,6 +1277,12 @@ class CobolEngine:
             except (DecompressionError, IntegrityError) as e:
                 logger.error(f"Layer 1 decompression failed: {e}")
                 raise
+
+        # Final integrity verification for the fully-decompressed block
+        if metadata.integrity_hash:
+            computed_hash = hashlib.sha256(current_data).digest()
+            if computed_hash != metadata.integrity_hash:
+                raise IntegrityError("Final decompression integrity check failed")
 
         return current_data
 
