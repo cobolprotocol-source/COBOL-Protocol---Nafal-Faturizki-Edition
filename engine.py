@@ -105,18 +105,18 @@ class GlobalPatternRegistry:
         """
         dict_hash = hashlib.sha256(dictionary_bytes).digest()
         self.layer_hashes[layer_name] = dict_hash
-        
-        # Update combined hash
-        self.combined_hash = hashlib.sha256(
-            self.combined_hash + dict_hash
-        ).digest()
-        
+
+        # Enforce deterministic layer order for combined hash
+        ordered_layers = sorted(self.layer_hashes.keys())
+        combined = b""
+        for lname in ordered_layers:
+            combined += lname.encode() + self.layer_hashes[lname]
+        self.combined_hash = hashlib.sha256(combined).digest()
+
         # Update registry hash for use as IV in layer 8
-        self._registry_hash = hashlib.sha256(
-            self.combined_hash
-        ).digest()
-        
-        logger.debug(f"Registered {layer_name} dictionary hash: {dict_hash.hex()[:16]}...")
+        self._registry_hash = hashlib.sha256(self.combined_hash).digest()
+
+        logger.debug(f"Registered {layer_name} dictionary hash: {dict_hash.hex()[:16]}... (chaining order: {ordered_layers})")
         return dict_hash
 
     def get_next_layer_key(self, current_layer: str) -> bytes:
@@ -730,12 +730,18 @@ class DictionaryManager:
             Dictionary object or None if not found
         """
         key = layer
+        # Enforce: dictionary must be registered and hash must exist (key-based substitution)
         if version == -1:
+            if key not in self.dictionaries or key not in self.dictionary_hashes:
+                raise DictionaryError(f"Dictionary for {key} not registered or missing hash (enforced key-based substitution)")
             return self.dictionaries.get(key)
         else:
             backups = self.backup_dictionaries.get(key, [])
             for d in backups:
                 if d.version == version:
+                    # Enforce hash for backup as well
+                    if key not in self.dictionary_hashes:
+                        raise DictionaryError(f"Dictionary for {key} version {version} missing hash (enforced key-based substitution)")
                     return d
             return None
 
@@ -754,19 +760,16 @@ class DictionaryManager:
             SHA-256 hash of the serialized dictionary
         """
         self.dictionaries[layer] = dictionary
-        
         # Compute cryptographic hash for layer chaining
         dict_bytes = dictionary.serialize()
         dict_hash = hashlib.sha256(dict_bytes).digest()
         self.dictionary_hashes[layer] = dict_hash
-        
         # Register with global registry if available
         if self.global_registry:
             self.global_registry.register_layer_dict(layer, dict_bytes)
-        
         logger.debug(
             f"Registered dictionary for {layer} (v{dictionary.version}, "
-            f"hash: {dict_hash.hex()[:16]}...)"
+            f"hash: {dict_hash.hex()[:16]}...) [enforced key-based substitution]"
         )
         return dict_hash
 
@@ -1710,6 +1713,10 @@ class CobolEngine:
         self.parallel_config = ParallelizationConfig(
             **self.config.get("parallelization", {})
         )
+        # Enforce chaining: every layer must register its dictionary hash
+        self._enforce_layer_chaining = True
+        # Fallback script for integrity failure
+        self._verify_script = "./verify.sh"
 
         # Initialize layer processors with cryptographic support
         self.layer1_semantic = Layer1SemanticMapper(self.dict_manager, self.global_registry)
@@ -1894,6 +1901,7 @@ class CobolEngine:
             if metadata.integrity_hash:
                 computed = hashlib.sha256(current_data).digest()
                 if computed != metadata.integrity_hash:
+                    self._trigger_verify_fail_safe()
                     raise IntegrityError("Final decompression integrity check failed")
             return current_data
 
@@ -1904,6 +1912,7 @@ class CobolEngine:
                 current_data = self.layer8_hardening.decompress(current_data, metadata)
             except (DecompressionError, IntegrityError) as e:
                 logger.error(f"Layer 8 unwrapping failed: {e}")
+                self._trigger_verify_fail_safe()
                 raise
 
         # Layer 3: Decompress Delta Encoding with unshuffling
@@ -1912,6 +1921,7 @@ class CobolEngine:
                 current_data = self.layer3_delta.decompress(current_data, metadata)
             except (DecompressionError, IntegrityError) as e:
                 logger.error(f"Layer 3 decompression failed: {e}")
+                self._trigger_verify_fail_safe()
                 raise
 
         # Layer 1: Decompress Semantic Mapping with decryption
@@ -1920,13 +1930,25 @@ class CobolEngine:
                 current_data = self.layer1_semantic.decompress(current_data, metadata)
             except (DecompressionError, IntegrityError) as e:
                 logger.error(f"Layer 1 decompression failed: {e}")
+                self._trigger_verify_fail_safe()
                 raise
 
         # Final integrity verification for the fully-decompressed block
         if metadata.integrity_hash:
             computed_hash = hashlib.sha256(current_data).digest()
             if computed_hash != metadata.integrity_hash:
+                self._trigger_verify_fail_safe()
                 raise IntegrityError("Final decompression integrity check failed")
+
+        return current_data
+
+    def _trigger_verify_fail_safe(self):
+        import subprocess
+        logger.critical("Integrity check failed! Triggering verify.sh fail-safe.")
+        try:
+            subprocess.run([self._verify_script], check=True)
+        except Exception as e:
+            logger.error(f"verify.sh fail-safe failed to execute: {e}")
 
         return current_data
 
