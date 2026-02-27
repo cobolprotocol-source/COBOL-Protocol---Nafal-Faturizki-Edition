@@ -1,0 +1,104 @@
+version: '3.8'
+
+services:
+  # Edge Node L1-2 (Semantic & Structural Mapping)
+  edge_node_l1:
+    build: .
+    container_name: cobol-edge-l1
+    environment:
+      - COBOL_LAYER=L1_L2
+      - COBOL_NODE_ID=edge1
+      - COBOL_MODE=processing
+    ports:
+      - "9001:9000"
+    volumes:
+      - ./data:/app/data
+    networks:
+      - cobol-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "from engine import CobolEngine; CobolEngine()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Edge Node L3-4 (Delta Encoding & Bit-Packing)
+  edge_node_l3:
+    build: .
+    container_name: cobol-edge-l3
+    environment:
+      - COBOL_LAYER=L3_L4
+      - COBOL_NODE_ID=edge2
+      - COBOL_MODE=processing
+    ports:
+      - "9002:9000"
+    volumes:
+      - ./data:/app/data
+    networks:
+      - cobol-network
+    restart: unless-stopped
+    depends_on:
+      - edge_node_l1
+    healthcheck:
+      test: ["CMD", "python", "-c", "from engine import CobolEngine; CobolEngine()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # High-Spec Node L5-6 (Advanced RLE & Patterns)
+  highspec_node_l5:
+    build: .
+    container_name: cobol-highspec-l5
+    environment:
+      - COBOL_LAYER=L5_L6
+      - COBOL_NODE_ID=highspec1
+      - COBOL_MODE=coordination
+    ports:
+      - "9005:9000"
+    volumes:
+      - ./data:/app/data
+    networks:
+      - cobol-network
+    restart: unless-stopped
+    depends_on:
+      - edge_node_l1
+      - edge_node_l3
+    healthcheck:
+      test: ["CMD", "python", "-c", "from engine import CobolEngine; CobolEngine()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # High-Spec Node L8 (Ultra-Extreme Mapping)
+  highspec_node_l8:
+    build: .
+    container_name: cobol-highspec-l8
+    environment:
+      - COBOL_LAYER=L8
+      - COBOL_NODE_ID=highspec2
+      - COBOL_MODE=final_aggregation
+    ports:
+      - "9008:9000"
+    volumes:
+      - ./data:/app/data
+    networks:
+      - cobol-network
+    restart: unless-stopped
+    depends_on:
+      - highspec_node_l5
+    healthcheck:
+      test: ["CMD", "python", "-c", "from engine import CobolEngine; CobolEngine()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+networks:
+  cobol-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
+volumes:
+  cobol-data:
+    driver: local
